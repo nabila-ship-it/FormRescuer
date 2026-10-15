@@ -4,6 +4,7 @@ import CurrentTabStatus from './components/CurrentTabStatus';
 import SavedDraftsList from './components/SavedDraftsList';
 import SettingsTab from './components/SettingsTab';
 import PrivacyNotice from './components/PrivacyNotice';
+import WebLandingPage from './components/WebLandingPage';
 
 const DEFAULT_SETTINGS = {
   autoRestore: true,
@@ -18,17 +19,33 @@ export default function App() {
   const [currentDraft, setCurrentDraft] = useState(null);
   const [allDrafts, setAllDrafts] = useState([]);
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+  const [isStandaloneWeb, setIsStandaloneWeb] = useState(false);
 
   // Helper to normalize current URL to storage key
   const computePageKey = (urlStr) => {
     try {
       const url = new URL(urlStr);
       ['utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'fbclid', 'gclid'].forEach(p => url.searchParams.delete(p));
-      return `fr_draft_${url.origin}${url.pathname}${url.search ? '?' + url.searchParams.toString() : ''}`;
+      const origin = (url.origin && url.origin !== 'null') ? url.origin : (url.protocol + '//' + url.host);
+      return `fr_draft_${origin}${url.pathname}${url.search ? '?' + url.searchParams.toString() : ''}`;
     } catch (e) {
       return `fr_draft_${urlStr.split('#')[0]}`;
     }
   };
+
+  // Determine if running as a web page (e.g. deployed on Vercel) or inside Chrome Extension popup
+  useEffect(() => {
+    const isExtensionPopup = (
+      typeof chrome !== 'undefined' &&
+      chrome.runtime &&
+      chrome.runtime.id &&
+      window.location.protocol === 'chrome-extension:' &&
+      window.innerWidth <= 450
+    );
+
+    // If on web (Vercel, localhost full window, etc.), display full web landing page
+    setIsStandaloneWeb(!isExtensionPopup);
+  }, []);
 
   // Load state from Chrome APIs or Mock data
   const refreshData = () => {
@@ -52,36 +69,36 @@ export default function App() {
 
           const pageKey = computePageKey(tab.url);
 
-          // Get draft for this tab
           chrome.storage.local.get([pageKey], (res) => {
-            setCurrentDraft(res[pageKey] || null);
+            setCurrentDraft(res ? res[pageKey] : null);
           });
         }
       });
 
       // 2. Load all drafts index
       chrome.storage.local.get(['fr_draft_index', 'fr_settings'], (res) => {
-        if (res.fr_settings) {
+        if (res && res.fr_settings) {
           setSettings({ ...DEFAULT_SETTINGS, ...res.fr_settings });
         }
-        if (res.fr_draft_index && Array.isArray(res.fr_draft_index)) {
+        if (res && res.fr_draft_index && Array.isArray(res.fr_draft_index)) {
           setAllDrafts(res.fr_draft_index);
         } else {
-          // If index is empty, scan storage keys
           chrome.storage.local.get(null, (all) => {
             const drafts = [];
-            Object.keys(all).forEach((k) => {
-              if (k.startsWith('fr_draft_') && k !== 'fr_draft_index') {
-                drafts.push(all[k]);
-              }
-            });
+            if (all) {
+              Object.keys(all).forEach((k) => {
+                if (k.startsWith('fr_draft_') && k !== 'fr_draft_index') {
+                  drafts.push(all[k]);
+                }
+              });
+            }
             drafts.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
             setAllDrafts(drafts);
           });
         }
       });
     } else {
-      // Development mode / browser preview fallback
+      // Development / Vercel fallback data
       const mockTab = {
         id: 1,
         url: 'https://docs.google.com/forms/d/e/1FAIpQLSc-Demo/viewform',
@@ -130,7 +147,7 @@ export default function App() {
 
   // Restore current tab form
   const handleRestoreCurrent = () => {
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
       if (typeof chrome !== 'undefined' && chrome.tabs && currentTabInfo?.id) {
         chrome.tabs.sendMessage(currentTabInfo.id, { action: 'RESTORE_NOW' }, (response) => {
           if (chrome.runtime.lastError) {
@@ -140,7 +157,6 @@ export default function App() {
           }
         });
       } else {
-        // Mock success in dev
         setTimeout(() => {
           resolve({ success: true, count: 4 });
         }, 400);
@@ -155,14 +171,12 @@ export default function App() {
 
     if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
       chrome.storage.local.remove([pageKey], () => {
-        // Update index
         chrome.storage.local.get(['fr_draft_index'], (res) => {
-          const index = res.fr_draft_index || [];
+          const index = (res && res.fr_draft_index) ? res.fr_draft_index : [];
           const updated = index.filter(i => i.key !== pageKey);
           chrome.storage.local.set({ fr_draft_index: updated }, () => {
             setCurrentDraft(null);
             setAllDrafts(updated);
-            // Notify content script
             if (currentTabInfo.id) {
               chrome.tabs.sendMessage(currentTabInfo.id, { action: 'CLEAR_CURRENT' }, () => {});
             }
@@ -199,7 +213,7 @@ export default function App() {
   const handleClearAllDrafts = () => {
     if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
       chrome.storage.local.get(null, (items) => {
-        const keysToRemove = Object.keys(items).filter(k => k.startsWith('fr_draft_'));
+        const keysToRemove = Object.keys(items || {}).filter(k => k.startsWith('fr_draft_'));
         chrome.storage.local.remove(keysToRemove, () => {
           chrome.storage.local.set({ fr_draft_index: [] }, () => {
             setCurrentDraft(null);
@@ -233,6 +247,28 @@ export default function App() {
 
   const activeFieldsCount = currentDraft?.fields ? Object.keys(currentDraft.fields).length : 0;
 
+  // Render Full Web Landing Page if accessed on Vercel / full browser width
+  if (isStandaloneWeb) {
+    return (
+      <WebLandingPage
+        mockData={{
+          currentTabInfo,
+          currentDraft,
+          allDrafts,
+          settings,
+          activeTab,
+          setActiveTab,
+          onRestore: handleRestoreCurrent,
+          onDeleteCurrent: handleDeleteCurrent,
+          onOpenDemo: handleOpenDemo,
+          onUpdateSettings: handleUpdateSettings,
+          onClearAllDrafts: handleClearAllDrafts
+        }}
+      />
+    );
+  }
+
+  // Render Compact Extension Popup (400px) when opened as Chrome Extension
   return (
     <div className="w-[400px] min-h-[540px] bg-slate-950 text-slate-100 flex flex-col justify-between selection:bg-blue-600 selection:text-white">
       <div>
